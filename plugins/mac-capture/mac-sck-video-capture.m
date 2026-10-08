@@ -71,6 +71,57 @@ API_AVAILABLE(macos(12.5)) static void sck_video_capture_destroy(void *data)
     bfree(sc);
 }
 
+API_AVAILABLE(macos(12.5)) static SCWindow *find_target_window(struct screen_capture *sc)
+{
+    for (SCWindow *window in sc->shareable_content.windows) {
+        if (window.windowID == sc->window) {
+            return window;
+        }
+    }
+
+    // Window IDs are reassigned whenever an application relaunches, so fall back to the owning
+    // application and title remembered from the last successful capture.
+    obs_data_t *settings = obs_source_get_settings(sc->source);
+    NSString *saved_bundle_id = @(obs_data_get_string(settings, "window_owner"));
+    NSString *saved_title = @(obs_data_get_string(settings, "window_title"));
+    obs_data_release(settings);
+
+    if (saved_bundle_id.length == 0) {
+        return nil;
+    }
+
+    SCWindow *last_titled_window = nil;
+    NSUInteger num_titled_windows = 0;
+    for (SCWindow *window in sc->shareable_content.windows) {
+        if (![window.owningApplication.bundleIdentifier isEqualToString:saved_bundle_id]) {
+            continue;
+        }
+        if (saved_title.length > 0 && [window.title isEqualToString:saved_title]) {
+            return window;
+        }
+        if (window.title.length > 0) {
+            last_titled_window = window;
+            num_titled_windows++;
+        }
+    }
+
+    // The title may have changed (e.g. a different document is open), which is only unambiguous
+    // when the application has a single titled window.
+    return (num_titled_windows == 1) ? last_titled_window : nil;
+}
+
+API_AVAILABLE(macos(12.5)) static void save_target_window(struct screen_capture *sc, SCWindow *window)
+{
+    obs_data_t *settings = obs_source_get_settings(sc->source);
+    NSString *bundle_id = window.owningApplication.bundleIdentifier;
+    NSString *title = window.title;
+
+    obs_data_set_int(settings, "window", window.windowID);
+    obs_data_set_string(settings, "window_owner", bundle_id ? bundle_id.UTF8String : "");
+    obs_data_set_string(settings, "window_title", title ? title.UTF8String : "");
+    obs_data_release(settings);
+}
+
 API_AVAILABLE(macos(12.5)) static bool init_screen_stream(struct screen_capture *sc)
 {
     SCContentFilter *content_filter;
@@ -137,12 +188,7 @@ API_AVAILABLE(macos(12.5)) static bool init_screen_stream(struct screen_capture 
         case ScreenCaptureWindowStream: {
             SCWindow *target_window = nil;
             if (sc->window != kCGNullWindowID) {
-                for (SCWindow *window in sc->shareable_content.windows) {
-                    if (window.windowID == sc->window) {
-                        target_window = window;
-                        break;
-                    }
-                }
+                target_window = find_target_window(sc);
             }
             if (target_window == nil) {
                 MACCAP_ERR("init_screen_stream: Invalid target window ID:  %u\n", sc->window);
@@ -151,6 +197,13 @@ API_AVAILABLE(macos(12.5)) static bool init_screen_stream(struct screen_capture 
                 os_event_init(&sc->stream_start_completed, OS_EVENT_TYPE_MANUAL);
                 return true;
             } else {
+                if (target_window.windowID != sc->window) {
+                    MACCAP_LOG(LOG_INFO, "init_screen_stream: Window ID %u no longer exists, using window %u of %s\n",
+                               sc->window, target_window.windowID,
+                               target_window.owningApplication.bundleIdentifier.UTF8String);
+                    sc->window = target_window.windowID;
+                }
+                save_target_window(sc, target_window);
                 content_filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:target_window];
 
                 [sc->stream_properties setWidth:(size_t) target_window.frame.size.width];
